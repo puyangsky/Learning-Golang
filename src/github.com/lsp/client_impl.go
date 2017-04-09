@@ -12,6 +12,7 @@ type client struct {
 	params   *Params
 	udpconn  *lspnet.UDPConn
 	connID   int
+	seqNum   int
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -64,6 +65,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		params:   params,
 		udpconn:  udpConn,
 		connID:   ackMsg.ConnID,
+		seqNum:   0,
 	}, nil
 }
 
@@ -93,6 +95,19 @@ func (c *client) Read() ([]byte, error) {
 
 	select {
 	case <- done:
+		//接收服务器端的数据完毕后，向服务器端发送ack
+		ackMsg := NewAck(c.connID, c.seqNum)
+		bytes, err := json.Marshal(ackMsg)
+		if err != nil {
+			println(err)
+			return nil, err
+		}
+		err = c.Write(bytes)
+		if err != nil {
+			println(err)
+			return nil, err
+		}
+		c.seqNum++
 		return payload, nil
 	//超时处理
 	case <- timeout:
@@ -100,13 +115,33 @@ func (c *client) Read() ([]byte, error) {
 	}
 }
 
+//发送消息
 func (c *client) Write(payload []byte) error {
+	//TODO：如果没有收到ack，则重新发送
 	go func() error {
 		_, err := c.udpconn.Write(payload)
 		if err != nil {
 			println(err)
 			return err
 		}
+
+		var read = make([]byte, 2000)
+		_, err = c.udpconn.Read(read)
+		if err != nil {
+			println(err)
+			return err
+		}
+
+		var ackMsg Message
+		err = json.Unmarshal(read, &ackMsg)
+		if err != nil {
+			println(err)
+			return err
+		}
+		if ackMsg{
+
+		}
+
 		return nil
 	}()
 	return nil
