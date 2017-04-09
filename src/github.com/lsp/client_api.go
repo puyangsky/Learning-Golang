@@ -1,17 +1,30 @@
+// DO NOT MODIFY THIS FILE!
+
 package lsp
 
-//客户端API
+// Client defines the interface for a LSP client.
 type Client interface {
-	//返回连接的ID
+	// ConnID returns the connection ID associated with this client.
 	ConnID() int
 
-	//从服务器端的socket中读取数据，并返回byte数组
+	// Read reads a data message from the server and returns its payload.
+	// This method should block until data has been received from the server and
+	// is ready to be returned. It should return a non-nil error if either
+	// (1) the connection has been explicitly closed, or (2) the connection has
+	// been lost due to an epoch timeout and no other messages are waiting to be
+	// returned.
 	Read() ([]byte, error)
 
-	//将payload数据写到socket，发送给服务器端
+	// Write sends a data message with the specified payload to the server.
+	// This method should NOT block, and should return a non-nil error
+	// if the connection with the server has been lost.
 	Write(payload []byte) error
 
-	//关闭连接
+	// Close terminates the client's connection with the server. It should block
+	// until all pending messages to the server have been sent and acknowledged.
+	// Once it returns, all goroutines running in the background should exit.
+	//
+	// You may assume that Read, Write, and Close will not be called after
+	// Close has been called.
 	Close() error
 }
-
