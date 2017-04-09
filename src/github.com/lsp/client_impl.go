@@ -3,16 +3,19 @@ package lsp
 import (
 	"github.com/lspnet"
 	"encoding/json"
-	"time"
 	"errors"
 )
 
 type client struct {
-	hostport string
-	params   *Params
-	udpconn  *lspnet.UDPConn
-	connID   int
-	seqNum   int
+	hostport 	string
+	params   	*Params
+	udpconn  	*lspnet.UDPConn
+	connID   	int // 客户端的连接ID
+	readChan 	chan *Message
+	writeChan	chan *Message
+	closeChan	chan byte
+	alive		bool
+	seqNum		int // 消息序列号，只有发送data message时才增长
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -26,7 +29,7 @@ type client struct {
 // hostport is a colon-separated string identifying the server's host address
 // and port number (i.e., "localhost:9999").
 
-func handleErr(err error) (Client, error) {
+func HandleErr(err error) (Client, error) {
 	if err != nil {
 		println(err)
 		return nil, err
@@ -36,37 +39,42 @@ func handleErr(err error) (Client, error) {
 
 func NewClient(hostport string, params *Params) (Client, error) {
 	udpAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
-	handleErr(err)
+	HandleErr(err)
 
 	udpConn, err := lspnet.DialUDP("udp4", nil, udpAddr)
-	handleErr(err)
+	HandleErr(err)
 
 	//创建连接请求消息
 	connectMsg := NewConnect()
 	//序列化
 	payload, err := json.Marshal(connectMsg)
-	handleErr(err)
+	HandleErr(err)
 
 	//发送消息
 	_, err = udpConn.Write(payload)
-	handleErr(err)
+	HandleErr(err)
 
 	//读取服务器端返回的消息
-	var readPayload = make([]byte, 2000)
+	var readPayload = make([]byte, 512)
 	_, err = udpConn.Read(readPayload)
-	handleErr(err)
+	HandleErr(err)
 	//反序列化
 	var ackMsg Message
 	err = json.Unmarshal(readPayload, &ackMsg)
-	handleErr(err)
+	HandleErr(err)
 
-	return &client{
+	client := &client{
 		hostport: hostport,
 		params:   params,
 		udpconn:  udpConn,
 		connID:   ackMsg.ConnID,
-		seqNum:   0,
-	}, nil
+		readChan: make(chan *Message),
+		writeChan:make(chan *Message, params.WindowSize),
+		alive:	  true,
+	}
+	go client.handleRead()
+	go client.handleWrite()
+	return client, nil
 }
 
 func (c *client) ConnID() int {
@@ -74,83 +82,81 @@ func (c *client) ConnID() int {
 }
 
 func (c *client) Read() ([]byte, error) {
-	timeout := make(chan bool)
-	done := make(chan bool)
-	payload := make([]byte, 2000)
-
-	go func() {
-		_, err := c.udpconn.Read(payload)
-		if err != nil {
-			println(err)
-		}
-		done <- true
-	}()
-
-	go func() {
-		for epochLimit := 0; epochLimit < c.params.EpochLimit; epochLimit++ {
-			time.Sleep(2 * time.Second)
-		}
-		timeout <- true
-	}()
-
 	select {
-	case <- done:
-		//接收服务器端的数据完毕后，向服务器端发送ack
-		ackMsg := NewAck(c.connID, c.seqNum)
-		bytes, err := json.Marshal(ackMsg)
-		if err != nil {
-			println(err)
-			return nil, err
-		}
-		err = c.Write(bytes)
-		if err != nil {
-			println(err)
-			return nil, err
-		}
-		c.seqNum++
-		return payload, nil
-	//超时处理
-	case <- timeout:
-		return nil, errors.New("[Error] Read timeout!")
+	case <- c.closeChan:
+		return nil, errors.New("[Error] Connection closed!")
+	//真正读消息的地方
+	case msg := <- c.readChan:
+		println("[INFO] Receive message from client: ", string(msg))
+		//读完消息后要返回一个ACK消息给服务器端
+		ackMsg := NewAck(c.connID, msg.SeqNum)
+		c.writeChan <- ackMsg
+		return msg.Payload, nil
+	//TODO：处理超时的情况
+	//case <-timeout:
+
 	}
 }
 
 //发送消息
 func (c *client) Write(payload []byte) error {
-	//TODO：如果没有收到ack，则重新发送
-	go func() error {
-		_, err := c.udpconn.Write(payload)
-		if err != nil {
-			println(err)
-			return err
-		}
-
-		var read = make([]byte, 2000)
-		_, err = c.udpconn.Read(read)
-		if err != nil {
-			println(err)
-			return err
-		}
-
-		var ackMsg Message
-		err = json.Unmarshal(read, &ackMsg)
-		if err != nil {
-			println(err)
-			return err
-		}
-		if ackMsg{
-
-		}
-
-		return nil
-	}()
+	if c.alive == false {
+		return errors.New("[Error] Connection closed!")
+	}
+	dataMsg := NewData(c.connID, c.seqNum, payload)
+	c.seqNum++
+	//塞到channel中，此处为none-block
+	c.writeChan <- dataMsg
 	return nil
 }
 
 func (c *client) Close() error {
+	close(c.closeChan)
+	c.alive = false
 	err := c.udpconn.Close()
-	if err != nil {
-		return err
+	return err
+}
+
+//用goroutine来不断监听读事件
+func (c *client) handleRead() {
+	for{
+		payload := make([]byte, 2000)
+		_, err := c.udpconn.Read(payload)
+		if err != nil {
+			return
+		}
+		//反序列化消息
+		var message *Message
+		err = json.Unmarshal(payload, &message)
+
+		//把从服务器端读取到的消息塞到readChan中
+		c.readChan <- message
 	}
-	return nil
+}
+
+func (c *client) handleWrite() {
+	for {
+		select {
+		case msg := <- c.writeChan:
+			if c.alive {
+				println("[INFO] Send message to server: ", msg.String())
+				//序列化消息
+				bytes, err := json.Marshal(msg)
+				if err != nil {
+					continue
+				}
+				//真正写消息的地方
+				c.udpconn.Write(bytes)
+				//TODO：写完消息要触发计时器，如果超时没收到ACK要重新发送消息
+
+			}
+		case <-c.closeChan:
+			return
+		}
+	}
+}
+
+
+func (c *client) FireEpoch() {
+
 }
