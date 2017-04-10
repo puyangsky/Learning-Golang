@@ -14,16 +14,16 @@ type clientInfo struct {
 	connID		int  			//客户端的编号
 	alive		bool 			//该客户端是否在线
 	addr		*lspnet.UDPAddr	//客户端的地址
-	writeChan	chan *Message
-	udpConn 		*lspnet.UDPConn
+	writeChan	chan *Message	//向客户端发送的消息缓冲区
+	udpConn 	*lspnet.UDPConn //客户端连接
+	timeoutChan	chan *Message	//消息超时channel
 }
 
 
 type server struct {
-	seqNum		int
-	//udpConn   	*lspnet.UDPConn
+	seqNum		int32
 	readChan	chan *Message
-	mapping		map[int]*clientInfo //clientInfo与ConnID之间的映射关系
+	mapping		map[int]*clientInfo //clientInfo与server之间的映射关系
 	closeChan	chan byte
 	alive		bool
 }
@@ -41,6 +41,9 @@ func addConnID() int32 {
 // project 0, etc.) and immediately return. It should return a non-nil error if
 // there was an error resolving or listening on the specified port number.
 func NewServer(port int, params *Params) (Server, error) {
+
+	lspnet.EnableDebugLogs(true)
+
 	udpAddr, err := lspnet.ResolveUDPAddr("udp", "localhost:" + strconv.Itoa(port))
 	HandleErr(err)
 
@@ -51,52 +54,14 @@ func NewServer(port int, params *Params) (Server, error) {
 
 	server := &server{
 		seqNum:		0,
-		//udpConn:	conn,
 		readChan:	make(chan *Message),
 		mapping:	make(map[int]*clientInfo),
 		closeChan:	make(chan byte),
 		alive:		true,
 	}
 
-	//TODO：把读操作移到handleRead方法中做
-	go func() {
-		for {
-			var payload = make([]byte, 1000)
-			_, addr, err := conn.ReadFromUDP(payload)
-			if err != nil {
-				return
-			}
-			var msg *Message
-			err = json.Unmarshal(payload, msg)
-			if err != nil {
-				return
-			}
-
-			_clientInfo := &clientInfo{
-				connID: int(connID),
-				alive:	true,
-				addr:	addr,
-				udpConn:	conn,
-			}
-
-			//客户端申请的连接请求
-			if msg.Type == MsgConnect {
-
-				//ID自增
-				addConnID()
-				server.mapping[_clientInfo.connID] = _clientInfo
-			}
-
-			if msg.Type == MsgData {
-				server.handleRead(_clientInfo)
-				server.handleWrite(_clientInfo)
-			}
-
-
-
-		}
-	}()
-
+	go server.handleRequest(conn)
+	go server.handleTimeout()
 	return server, nil
 }
 
@@ -104,6 +69,7 @@ func (s *server) Read() (int, []byte, error) {
 	select {
 	case msg := <- s.readChan:
 		println("[INFO] Send message to client: ", msg.String())
+		//真正读的地方
 		return msg.ConnID, msg.Payload, nil
 	case <- s.closeChan:
 		return -1, nil, nil
@@ -112,8 +78,8 @@ func (s *server) Read() (int, []byte, error) {
 
 func (s *server) Write(connID int, payload []byte) error {
 	if _client, ok := s.mapping[connID]; ok {
-		message := NewData(connID, s.seqNum, payload)
-		s.seqNum++
+		message := NewData(connID, int(s.seqNum), payload)
+		s.atomicAddSeq()
 		//把消息塞到writeChan中
 		_client.writeChan <- message
 		return nil
@@ -135,21 +101,8 @@ func (s *server) Close() error {
 
 
 
-func (s *server) handleRead(_client *clientInfo) {
-	for {
-		var payload = make([]byte, 1000)
-		_, err := _client.udpConn.Read(payload)
-		if err != nil {
-			return
-		}
-
-		//反序列化
-		var message *Message
-		err = json.Unmarshal(payload, message)
-		if err != nil {
-			return
-		}
-	}
+func (s *server) handleRead(msg *Message) {
+	s.readChan <- msg
 }
 
 
@@ -181,4 +134,85 @@ func (s *server) handleWrite(_client *clientInfo) {
 			return
 		}
 	}
+}
+
+func (s *server)handleRequest(conn *lspnet.UDPConn)  {
+	for {
+		var payload = make([]byte, 1000)
+		_, addr, err := conn.ReadFromUDP(payload)
+		if err != nil {
+			return
+		}
+		var msg *Message
+		err = json.Unmarshal(payload, msg)
+		if err != nil {
+			return
+		}
+
+		var _client *clientInfo
+
+		if msg.Type == MsgConnect {
+			_client = &clientInfo{
+				connID: 	 int(connID),
+				alive:		 true,
+				writeChan:	 make(chan *Message),
+				addr:	     addr,
+				udpConn:	 conn,
+				timeoutChan: make(chan *Message),
+			}
+			s.mapping[_client.connID] = _client
+			//ConnID自增
+			addConnID()
+			//发送ACK给客户端
+			go s.sendAck(_client, msg)
+		}
+
+		if msg.Type == MsgData {
+			_client, ok := s.mapping[msg.ConnID]
+			if !ok {
+				continue
+			}
+			go s.handleRead(msg)
+			//发送ACK给客户端
+			go s.sendAck(_client, msg)
+		}
+
+		if msg.Type == MsgAck {
+			//TODO 接收到ACK，解除超时警报
+		}
+
+		go s.handleWrite(_client)
+	}
+}
+
+func (s *server) sendAck(_client *clientInfo, msg *Message) error {
+	ack := NewAck(_client.connID, msg.SeqNum)
+	payload, err := json.Marshal(ack)
+	if err != nil {
+		return err
+	}
+	_, err = _client.udpConn.WriteToUDP(payload, _client.addr)
+	return err
+}
+
+/*
+处理超时的协程
+*/
+func (s *server) handleTimeout()  {
+	for {
+		for connid, _client := range s.mapping {
+			println(connid)
+			println(_client)
+			select {
+
+			}
+		}
+	}
+
+}
+/*
+线程安全地自增序列号
+ */
+func (s *server) atomicAddSeq() {
+	atomic.AddInt32(&s.seqNum, 1)
 }
