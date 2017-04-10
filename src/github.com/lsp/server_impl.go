@@ -8,15 +8,17 @@ import (
 	"github.com/lspnet"
 	"strconv"
 	"encoding/json"
+	"time"
 )
 
 type clientInfo struct {
-	connID		int  			//客户端的编号
-	alive		bool 			//该客户端是否在线
-	addr		*lspnet.UDPAddr	//客户端的地址
-	writeChan	chan *Message	//向客户端发送的消息缓冲区
-	udpConn 	*lspnet.UDPConn //客户端连接
-	timeoutChan	chan *Message	//消息超时channel
+	connID			int  					//客户端的编号
+	alive			bool 					//该客户端是否在线
+	addr			*lspnet.UDPAddr			//客户端的地址
+	writeChan		chan *Message			//向客户端发送的消息缓冲区
+	udpConn 		*lspnet.UDPConn 		//客户端连接
+	timerChan		chan *Message			//计时器channel
+	timeoutChanMap	map[int]chan *Message	//超时channel
 }
 
 
@@ -26,6 +28,7 @@ type server struct {
 	mapping		map[int]*clientInfo //clientInfo与server之间的映射关系
 	closeChan	chan byte
 	alive		bool
+	params		*Params
 }
 
 var connID int32 = 0
@@ -58,6 +61,7 @@ func NewServer(port int, params *Params) (Server, error) {
 		mapping:	make(map[int]*clientInfo),
 		closeChan:	make(chan byte),
 		alive:		true,
+		params:		params,
 	}
 
 	go server.handleRequest(conn)
@@ -125,6 +129,10 @@ func (s *server) handleWrite(_client *clientInfo) {
 						return
 					}
 					println("[INFO] Send message to client: ", msg.String())
+
+					//发送完消息要注册超时计时器到客户端的timeoutChan中
+					client.timerChan <- msg
+
 				}
 			} else {
 				return
@@ -153,32 +161,35 @@ func (s *server)handleRequest(conn *lspnet.UDPConn)  {
 
 		if msg.Type == MsgConnect {
 			_client = &clientInfo{
-				connID: 	 int(connID),
-				alive:		 true,
-				writeChan:	 make(chan *Message),
-				addr:	     addr,
-				udpConn:	 conn,
-				timeoutChan: make(chan *Message),
+				connID: 	 	int(connID),
+				alive:		 	true,
+				writeChan:	 	make(chan *Message, s.params.WindowSize),
+				addr:	     	addr,
+				udpConn:	 	conn,
+				timerChan:		make(chan *Message),
+				timeoutChanMap: make(map[int]chan *Message),
 			}
 			s.mapping[_client.connID] = _client
 			//ConnID自增
 			addConnID()
 			//发送ACK给客户端
 			go s.sendAck(_client, msg)
-		}
-
-		if msg.Type == MsgData {
+		}else {
 			_client, ok := s.mapping[msg.ConnID]
 			if !ok {
 				continue
 			}
-			go s.handleRead(msg)
-			//发送ACK给客户端
-			go s.sendAck(_client, msg)
-		}
 
-		if msg.Type == MsgAck {
-			//TODO 接收到ACK，解除超时警报
+			if msg.Type == MsgData {
+				go s.handleRead(msg)
+				//发送ACK给客户端
+				go s.sendAck(_client, msg)
+			} else if msg.Type == MsgAck {
+				//接收到ACK，解除超时警报
+				var timeoutChan = make(chan *Message)
+				timeoutChan <- msg
+				_client.timeoutChanMap[msg.SeqNum] = timeoutChan
+			}
 		}
 
 		go s.handleWrite(_client)
@@ -196,15 +207,21 @@ func (s *server) sendAck(_client *clientInfo, msg *Message) error {
 }
 
 /*
-处理超时的协程
+TODO 处理超时的协程
 */
-func (s *server) handleTimeout()  {
+func (s *server) handleTimeout() error {
 	for {
-		for connid, _client := range s.mapping {
-			println(connid)
-			println(_client)
+		//遍历每个客户端
+		for _, _client := range s.mapping {
 			select {
-
+			case timerMsg := <- _client.timerChan:
+				select {
+					//TODO 超时重发，最大次数时判定客户端连接挂了
+					case time.After(2*time.Second):
+						return errors.New("Message Timeout")
+					case <-_client.timeoutChanMap[timerMsg.SeqNum]:
+						continue
+					}
 			}
 		}
 	}
