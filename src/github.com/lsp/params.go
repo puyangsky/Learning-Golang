@@ -12,7 +12,7 @@ const (
 //参数结构体
 type Params struct {
 	EpochLimit int
-	EpochMills int
+	EpochMillis int
 	WindowSize int
 }
 
@@ -21,7 +21,7 @@ type Params struct {
 func NewParams() *Params {
 	return &Params{
 		EpochLimit: DefaultEpochLimit,
-		EpochMills: DefaultEpochMillis,
+		EpochMillis: DefaultEpochMillis,
 		WindowSize: DefaultWindowSize,
 	}
 }
@@ -30,5 +30,5 @@ func NewParams() *Params {
 //toString
 func(p *Params) String() string {
 	return fmt.Sprintf("[EpochLimit: %d, EpochMillis: %d, WindowSize: %d]",
-		p.EpochLimit, p.EpochMills, p.WindowSize)
+		p.EpochLimit, p.EpochMillis, p.WindowSize)
 }
