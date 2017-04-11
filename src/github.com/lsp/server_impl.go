@@ -217,13 +217,19 @@ func (s *server)handleRequest(conn *lspnet.UDPConn)  {
 }
 
 func (s *server) sendAck(_client *clientInfo, msg *Message) error {
-	ack := NewAck(_client.connID, msg.SeqNum)
-	payload, err := json.Marshal(ack)
-	if err != nil {
+	if msg.Type == MsgConnect {
+		ackToConnect := NewAck(_client.connID, _client.curSeqNum)
+		_client.writeChan <- ackToConnect
+	}else {
+		ack := NewAck(_client.connID, msg.SeqNum)
+		payload, err := json.Marshal(ack)
+		if err != nil {
+			return err
+		}
+		// TODO 改成异步的方式发送
+		_, err = _client.udpConn.WriteToUDP(payload, _client.addr)
 		return err
 	}
-	_, err = _client.udpConn.WriteToUDP(payload, _client.addr)
-	return err
 }
 
 /*

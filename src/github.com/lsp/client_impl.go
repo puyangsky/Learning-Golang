@@ -32,29 +32,11 @@ type client struct {
 // and port number (i.e., "localhost:9999").
 
 func NewClient(hostport string, params *Params) (Client, error) {
+
 	udpAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
 	HandleErr(err)
 
 	udpConn, err := lspnet.DialUDP("udp4", nil, udpAddr)
-	HandleErr(err)
-
-	//创建连接请求消息
-	connectMsg := NewConnect()
-	//序列化
-	payload, err := json.Marshal(connectMsg)
-	HandleErr(err)
-
-	//发送消息
-	_, err = udpConn.Write(payload)
-	HandleErr(err)
-
-	//读取服务器端返回的消息
-	var readPayload = make([]byte, 1000)
-	_, err = udpConn.Read(readPayload)
-	HandleErr(err)
-	//反序列化
-	var ackMsg Message
-	err = json.Unmarshal(readPayload, &ackMsg)
 	HandleErr(err)
 
 	timer := &timer{
@@ -66,7 +48,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		hostport: 	hostport,
 		params:   	params,
 		udpConn:  	udpConn,
-		connID:   	ackMsg.ConnID,
+		connID:   	0,
 		readChan: 	make(chan *Message),
 		writeChan:	make(chan *Message, params.WindowSize),
 		closeChan:	make(chan byte),
@@ -74,9 +56,12 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		seqNum:		1,
 		timer:		timer,
 	}
+
+	go client.connect(hostport)
 	go client.handleRead()
 	go client.handleWrite()
 	go client.handleTimeout()
+
 	return client, nil
 }
 
@@ -139,9 +124,13 @@ func (c *client) handleRead() {
 			}
 		case MsgAck:
 			//接收到ACK，解除超时警报
-			var timeoutChan = make(chan *Message)
-			timeoutChan <- message
-			c.timer.timeoutChanMap[message.SeqNum] = timeoutChan
+			//TODO 注意对connectMsg的ACK消息
+			if message.SeqNum == 0 {
+			}else {
+				var timeoutChan = make(chan *Message)
+				timeoutChan <- message
+				c.timer.timeoutChanMap[message.SeqNum] = timeoutChan
+			}
 		}
 
 	}
@@ -161,7 +150,9 @@ func (c *client) handleWrite() {
 				//真正写消息的地方
 				c.udpConn.Write(bytes)
 				//写完消息，触发计时器，如果超时没收到ACK要重新发送消息
-				c.timer.timeoutChanMap[msg.SeqNum] <- msg
+				if msg.Type == MsgConnect || msg.Type == MsgData {
+					c.timer.timerChan <- msg
+				}
 			}
 		case <-c.closeChan:
 			return
@@ -174,11 +165,7 @@ func (c *client) handleWrite() {
  */
 func (c *client) sendAck(msg *Message)  {
 	ack := NewAck(msg.ConnID, msg.SeqNum)
-	bytes, err := json.Marshal(ack)
-	if err != nil {
-		return
-	}
-	c.udpConn.Write(bytes)
+	c.writeChan <- ack
 }
 
 /*
@@ -187,9 +174,11 @@ func (c *client) sendAck(msg *Message)  {
 func (c *client) handleTimeout() {
 	for{
 		select {
+		//开始计时
 		case timerMsg := <- c.timer.timerChan:
 			timeoutChan := time.After(time.Millisecond * time.Duration(c.params.EpochMillis))
 			select {
+				//连接超时
 				case <- timeoutChan:
 					times, ok := c.timer.epochTimes[timerMsg.SeqNum]
 					if ok && times < c.params.EpochLimit {
@@ -200,6 +189,8 @@ func (c *client) handleTimeout() {
 						c.alive = false
 						close(c.closeChan)
 					}
+				case <- c.timer.connectChan:
+					continue
 				case <- c.timer.timeoutChanMap[timerMsg.SeqNum]:
 					continue
 				}
@@ -226,4 +217,14 @@ func (c *client) resend(msg *Message)  {
 	c.timer.timerChan <- msg
 	//epoch次数加一
 	c.timer.epochTimes[msg.SeqNum]++
+}
+
+func (c *client) connect(hostport string)  {
+
+	//创建连接请求消息
+	connectMsg := NewConnect()
+
+	c.writeChan <- connectMsg
+
+
 }
