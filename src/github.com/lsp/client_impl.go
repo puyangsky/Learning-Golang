@@ -126,6 +126,7 @@ func (c *client) handleRead() {
 			//接收到ACK，解除超时警报
 			//TODO 注意对connectMsg的ACK消息
 			if message.SeqNum == 0 {
+				c.timer.connectChan <- message
 			}else {
 				var timeoutChan = make(chan *Message)
 				timeoutChan <- message
@@ -148,7 +149,10 @@ func (c *client) handleWrite() {
 					continue
 				}
 				//真正写消息的地方
-				c.udpConn.Write(bytes)
+				_, err = c.udpConn.Write(bytes)
+				if err != nil {
+					continue
+				}
 				//写完消息，触发计时器，如果超时没收到ACK要重新发送消息
 				if msg.Type == MsgConnect || msg.Type == MsgData {
 					c.timer.timerChan <- msg
@@ -185,12 +189,14 @@ func (c *client) handleTimeout() {
 						go c.resend(timerMsg)
 					}else {
 						//达到最大次数，判定连接断开
-						println("[DEBUG] Message Timeout, ConnID: ", timerMsg.ConnID, ", seqNum: ", timerMsg.SeqNum)
+						println("[DEBUG] Message timeout, exiting...")
 						c.alive = false
 						close(c.closeChan)
 					}
-				case <- c.timer.connectChan:
-					continue
+				//收到connectMsg的ack
+				case connectAckMsg := <- c.timer.connectChan:
+					c.connID = connectAckMsg.ConnID
+				//收到dataMsg的ack
 				case <- c.timer.timeoutChanMap[timerMsg.SeqNum]:
 					continue
 				}
@@ -223,8 +229,5 @@ func (c *client) connect(hostport string)  {
 
 	//创建连接请求消息
 	connectMsg := NewConnect()
-
 	c.writeChan <- connectMsg
-
-
 }

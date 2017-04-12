@@ -117,11 +117,11 @@ func (s *server) handleRead(msg *Message) {
 }
 
 
-
 func (s *server) handleWrite(_client *clientInfo) {
 	for {
 		select {
 		case msg := <- _client.writeChan:
+			// TODO 注意msg的类型
 			bytes, err := json.Marshal(msg)
 			if err != nil {
 				return
@@ -216,19 +216,14 @@ func (s *server)handleRequest(conn *lspnet.UDPConn)  {
 	}
 }
 
-func (s *server) sendAck(_client *clientInfo, msg *Message) error {
+func (s *server) sendAck(_client *clientInfo, msg *Message) {
 	if msg.Type == MsgConnect {
 		ackToConnect := NewAck(_client.connID, _client.curSeqNum)
 		_client.writeChan <- ackToConnect
 	}else {
 		ack := NewAck(_client.connID, msg.SeqNum)
-		payload, err := json.Marshal(ack)
-		if err != nil {
-			return err
-		}
 		// TODO 改成异步的方式发送
-		_, err = _client.udpConn.WriteToUDP(payload, _client.addr)
-		return err
+		_client.writeChan <- ack
 	}
 }
 
