@@ -13,7 +13,7 @@ import (
 func main()  {
 
 	port := 20001
-	server, err := lsp.NewServer(port, makeParams(1,1000,2))
+	_, err := lsp.NewServer(port, makeParams(1,1000,2))
 	errorHandler(err)
 	println("start server")
 
@@ -29,9 +29,10 @@ func main()  {
 
 	println(cli.ConnID())
 
+	//server.Read()
+
 	data := []byte("fuck")
 	cli.Write(data)
-	server.Read()
 }
 
 func makeParams(epochLimit, epochMillis, windowSize int) *lsp.Params {

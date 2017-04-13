@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+	"sync/atomic"
 )
 
 type client struct {
@@ -16,7 +17,7 @@ type client struct {
 	writeChan	chan *Message
 	closeChan	chan byte
 	alive		bool			//服务器是否在线
-	seqNum		int 			// 消息序列号，只有发送data message时才增长
+	seqNum		int32 			// 消息序列号，只有发送data message时才增长
 	timer 		*timer
 }
 
@@ -39,7 +40,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 	udpConn, err := lspnet.DialUDP("udp4", nil, udpAddr)
 	HandleErr(err)
 
-	defer udpConn.Close()
+	//defer udpConn.Close()
 
 	var ackMsg *Message
 	connectMsg := NewConnect()
@@ -112,13 +113,12 @@ func (c *client) ConnID() int {
 func (c *client) Read() ([]byte, error) {
 	select {
 	case <- c.closeChan:
-		return nil, errors.New("[Error] Connection closed!")
+		return nil, errors.New("<<<[Error] Connection closed!")
 	//真正读消息的地方
 	case msg := <- c.readChan:
-		println("[INFO] Receive message from client: ", msg.String())
+		println("<<<[INFO] Client receive message from server: ", msg.String())
 		//读完消息后要返回一个ACK消息给服务器端
-		ackMsg := NewAck(c.connID, msg.SeqNum)
-		c.writeChan <- ackMsg
+		go c.sendAck(msg)
 		return msg.Payload, nil
 	}
 }
@@ -126,10 +126,11 @@ func (c *client) Read() ([]byte, error) {
 //发送消息
 func (c *client) Write(payload []byte) error {
 	if c.alive == false {
-		return errors.New("[Error] Connection closed!")
+		return errors.New("<<<[Error] Connection closed!")
 	}
-	dataMsg := NewData(c.connID, c.seqNum, payload)
-	c.seqNum++
+	dataMsg := NewData(c.connID, int(c.seqNum), payload)
+	//创建新的dataMsg时，自增seqNum
+	c.atomicAddSeq()
 	//塞到channel中，此处为none-block
 	c.writeChan <- dataMsg
 	return nil
@@ -145,9 +146,11 @@ func (c *client) Close() error {
 //用goroutine来不断监听读事件
 func (c *client) handleRead() {
 	for{
+		println("<<<[Client] handle Read...")
 		payload := make([]byte, 1000)
 		n, err := c.udpConn.Read(payload)
 		if err != nil {
+			println(err.Error())
 			return
 		}
 		//反序列化消息
@@ -157,12 +160,16 @@ func (c *client) handleRead() {
 		switch message.Type {
 		case MsgData:
 			// 过滤已经读过的消息
-			if message.SeqNum < c.seqNum {
+			//if message.SeqNum < c.seqNum {
 				//把从服务器端读取到的消息塞到readChan中
-				c.readChan <- message
-				go c.sendAck(message)
+			c.readChan <- message
+			//读到服务器端的新dataMsg时，更新client端的seqNum
+			if message.SeqNum > int(c.seqNum) {
+				c.seqNum = int32(message.SeqNum)
 			}
+			//}
 		case MsgAck:
+			println("<<<[Client] handle Read ACK...", message.String())
 			//接收到ACK，解除超时警报
 			var timeoutChan = make(chan *Message)
 			timeoutChan <- message
@@ -176,12 +183,9 @@ func (c *client) handleWrite() {
 	for {
 		select {
 		case msg := <- c.writeChan:
-			//println("[INFO] Send message to server: ", msg.String())
-			if msg.Type == MsgConnect {
-				continue
-			}
+
 			if c.alive {
-				println("[INFO] Client send message to server: ", msg.String())
+				println("<<<[INFO] Client send message to server: ", msg.String())
 				//序列化消息
 				bytes, err := json.Marshal(msg)
 				if err != nil {
@@ -192,9 +196,12 @@ func (c *client) handleWrite() {
 				if err != nil {
 					continue
 				}
-				//写完消息，触发计时器，如果超时没收到ACK要重新发送消息
-				if msg.Type == MsgConnect || msg.Type == MsgData {
+				//写完消息，触发计时器
+				if msg.Type == MsgData {
+					println("<<<[INFO] Client start timer ", msg.String())
 					c.timer.timerChan <- msg
+					//初始化重试次数
+					c.timer.epochTimes[msg.SeqNum] = 0
 				}
 			}
 		case <-c.closeChan:
@@ -207,8 +214,10 @@ func (c *client) handleWrite() {
 发送ack
  */
 func (c *client) sendAck(msg *Message)  {
-	ack := NewAck(msg.ConnID, msg.SeqNum)
-	c.writeChan <- ack
+	if msg.Type == MsgData {
+		ack := NewAck(msg.ConnID, msg.SeqNum)
+		c.writeChan <- ack
+	}
 }
 
 /*
@@ -219,22 +228,27 @@ func (c *client) handleTimeout() {
 		select {
 		//开始计时
 		case timerMsg := <- c.timer.timerChan:
+			println("<<<[DEBUG] Client timer start:", timerMsg.String())
 			timeoutChan := time.After(time.Millisecond * time.Duration(c.params.EpochMillis))
 			select {
 				//连接超时
 				case <- timeoutChan:
 					times, ok := c.timer.epochTimes[timerMsg.SeqNum]
 					if ok && times < c.params.EpochLimit {
+						println("<<<[DEBUG] Client", times, "th timeout, resend")
 						go c.resend(timerMsg)
 					}else {
 						//达到最大次数，判定连接断开
-						println("[DEBUG] Message timeout, exiting...")
+						println("<<<[DEBUG] Message timeout, exiting...")
 						c.alive = false
 						close(c.closeChan)
+						return
 					}
 
+				//TODO 这里有bug！！！
 				//收到dataMsg的ack
-				case <- c.timer.timeoutChanMap[timerMsg.SeqNum]:
+				case ack := <- c.timer.timeoutChanMap[timerMsg.SeqNum]:
+					println("<<<[DEBUG] Client get ack ", ack.String())
 					continue
 				}
 		case <- c.closeChan:
@@ -257,8 +271,12 @@ func (c *client) resend(msg *Message)  {
 		println(err.Error())
 		return
 	}
+	//epoch次数加一
+	c.timer.epochTimes[msg.SeqNum] = c.timer.epochTimes[msg.SeqNum] + 1
 	//再次加入计时器
 	c.timer.timerChan <- msg
-	//epoch次数加一
-	c.timer.epochTimes[msg.SeqNum]++
+}
+
+func (c *client) atomicAddSeq()  {
+	atomic.AddInt32(&c.seqNum, 1)
 }
