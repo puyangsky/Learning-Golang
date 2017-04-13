@@ -1,42 +1,44 @@
+// DO NOT MODIFY THIS FILE!
+
 package lsp
 
 import "fmt"
 
-//定义消息类型
+// MsgType is an integer code describing an LSP message type.
 type MsgType int
 
 const (
-	MsgConnect MsgType = iota  // Sent by clients to make a connection w/ the server.
-	MsgData                    // Sent by clients/servers to send data.
-	MsgAck                     // Sent by clients/servers to ack connect/data msgs.
+	MsgConnect MsgType = iota // Sent by clients to make a connection w/ the server.
+	MsgData                   // Sent by clients/servers to send data.
+	MsgAck                    // Sent by clients/servers to ack connect/data msgs.
 )
 
-
-//定义消息结构体
+// Message represents a message used by the LSP protocol.
 type Message struct {
-	Type    MsgType
-	ConnID  int
-	SeqNum  int
-	Payload []byte
+	Type    MsgType // One of the message types listed above.
+	ConnID  int     // Unique client-server connection ID.
+	SeqNum  int     // Message sequence number.
+	Payload []byte  // Data message payload.
 }
 
-
-//创建一个连接请求
+// NewConnect returns a new connect message.
 func NewConnect() *Message {
 	return &Message{Type: MsgConnect}
 }
 
-//创建一个数据消息
-func NewData(connID int, seqNum int, payload []byte) *Message {
+// NewData returns a new data message with the specified connection ID,
+// sequence number, and payload.
+func NewData(connID, seqNum int, payload []byte) *Message {
 	return &Message{
-		Type: MsgConnect,
-		ConnID: connID,
-		SeqNum: seqNum,
+		Type:    MsgData,
+		ConnID:  connID,
+		SeqNum:  seqNum,
 		Payload: payload,
 	}
 }
 
-//创建一个确认消息
+// NewAck returns a new acknowledgement message with the specified
+// connection ID and sequence number.
 func NewAck(connID, seqNum int) *Message {
 	return &Message{
 		Type:   MsgAck,
@@ -45,7 +47,10 @@ func NewAck(connID, seqNum int) *Message {
 	}
 }
 
-
+// String returns a string representation of this message. To pretty-print a
+// message, you can pass it to a format string like so:
+//     msg := NewConnect()
+//     fmt.Printf("Connect message: %s\n", msg)
 func (m *Message) String() string {
 	var name, payload string
 	switch m.Type {

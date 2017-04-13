@@ -35,8 +35,8 @@ type server struct {
 
 var connID int32 = 0
 
-func addConnID() int32 {
-	return atomic.AddInt32(&connID, 1)
+func addConnID() {
+	atomic.AddInt32(&connID, 1)
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -49,13 +49,14 @@ func NewServer(port int, params *Params) (Server, error) {
 
 	lspnet.EnableDebugLogs(true)
 
-	udpAddr, err := lspnet.ResolveUDPAddr("udp", "localhost:" + strconv.Itoa(port))
+	udpAddr, err := lspnet.ResolveUDPAddr("udp4", ":" + strconv.Itoa(port))
 	HandleErr(err)
 
-	conn, err := lspnet.ListenUDP("udp", udpAddr)
+	conn, err := lspnet.ListenUDP("udp4", udpAddr)
 	HandleErr(err)
+	println("[DEBUG] Server listen at :", port)
 
-	println("[DEBUG]Server listen at localhost:", port)
+	//defer conn.Close()
 
 	server := &server{
 		seqNum:		0,
@@ -74,7 +75,7 @@ func NewServer(port int, params *Params) (Server, error) {
 func (s *server) Read() (int, []byte, error) {
 	select {
 	case msg := <- s.readChan:
-		println("[INFO] Send message to client: ", msg.String())
+		println("[INFO] Read message from client: ", msg.String())
 		//真正读的地方
 		return msg.ConnID, msg.Payload, nil
 	case <- s.closeChan:
@@ -138,7 +139,7 @@ func (s *server) handleWrite(_client *clientInfo) {
 					println("[INFO] Send message to client: ", msg.String())
 
 					// 发送完消息
-					// 注册超时计时器到客户端的timer中
+					// 注册计时器到客户端的timer中
 					client.timer.timerChan <- msg
 					client.timer.epochTimes[msg.SeqNum] = 0
 				}
@@ -152,26 +153,31 @@ func (s *server) handleWrite(_client *clientInfo) {
 	}
 }
 
-func (s *server)handleRequest(conn *lspnet.UDPConn)  {
+func (s *server)handleRequest(conn *lspnet.UDPConn) {
 	for {
 		var payload = make([]byte, 1000)
-		_, addr, err := conn.ReadFromUDP(payload)
+		n, addr, err := conn.ReadFromUDP(payload)
+		println("read ", n, " byte")
 		if err != nil {
+			println(err.Error())
 			return
 		}
+
 		var msg *Message
-		err = json.Unmarshal(payload, msg)
+		err = json.Unmarshal(payload[0:n], &msg)
 		if err != nil {
+			println(err.Error())
 			return
 		}
+		println("Get a connection,", addr.String(), msg.String())
 
 		var _client *clientInfo
 
 		_, exist := s.mapping[msg.ConnID]
+
 		if msg.Type == MsgConnect && !exist {
 
 			//检查是否已经创建了该连接，若已经创建，discard该消息
-
 			_timer := &timer{
 				timerChan:		make(chan *Message),
 				timeoutChanMap: make(map[int]chan *Message),
@@ -192,7 +198,7 @@ func (s *server)handleRequest(conn *lspnet.UDPConn)  {
 			//ConnID自增
 			addConnID()
 			//发送ACK给客户端
-			go s.sendAck(_client, msg)
+			s.sendAck(_client, msg)
 		}else {
 			_client, ok := s.mapping[msg.ConnID]
 			//不存在该客户端，或该消息已读，跳过
@@ -222,7 +228,7 @@ func (s *server) sendAck(_client *clientInfo, msg *Message) {
 		_client.writeChan <- ackToConnect
 	}else {
 		ack := NewAck(_client.connID, msg.SeqNum)
-		// TODO 改成异步的方式发送
+		// 异步的方式发送
 		_client.writeChan <- ack
 	}
 }
