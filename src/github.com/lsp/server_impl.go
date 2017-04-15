@@ -3,12 +3,13 @@
 package lsp
 
 import (
-	"errors"
+	//"errors"
 	"sync/atomic"
 	"github.com/lspnet"
 	"strconv"
 	"encoding/json"
 	"time"
+	//"sync"
 )
 
 
@@ -19,14 +20,14 @@ type clientInfo struct {
 	addr			*lspnet.UDPAddr		//客户端的地址
 	writeChan		chan *Message		//向客户端发送的消息缓冲区
 	udpConn 		*lspnet.UDPConn 	//客户端连接
-	timers			map[int]*timer		//计时器
+	timers			[]*timer		//计时器
 	curSeqNum		int32				//当前消息序号，用来去除已读消息
 }
 
 
 type server struct {
 	readChan	chan *Message
-	mapping		map[int]*clientInfo //clientInfo与server之间的映射关系
+	clients		[]*clientInfo //clientInfo与server之间的映射关系
 	closeChan	chan byte
 	alive		bool
 	params		*Params
@@ -59,7 +60,7 @@ func NewServer(port int, params *Params) (Server, error) {
 
 	server := &server{
 		readChan:	make(chan *Message),
-		mapping:	make(map[int]*clientInfo),
+		clients:	make([]*clientInfo, 0, 0),
 		closeChan:	make(chan byte),
 		alive:		true,
 		params:		params,
@@ -82,32 +83,32 @@ func (s *server) Read() (int, []byte, error) {
 }
 
 func (s *server) Write(connID int, payload []byte) error {
-	if _client, ok := s.mapping[connID]; ok {
-		message := NewData(connID, int(_client.curSeqNum), payload)
-		//更新客户端的消息序列
-		_client.atomicAddSeq()
-		//把消息塞到writeChan中
-		_client.writeChan <- message
-		return nil
-	}else{
-		return errors.New("Invalid connID")
-	}
+	_client := s.clients[connID]
+	message := NewData(connID, int(_client.curSeqNum), payload)
+	//更新客户端的消息序列
+	_client.atomicAddSeq()
+	//把消息塞到writeChan中
+	_client.writeChan <- message
+	return nil
+
 }
 
 func (s *server) CloseConn(connID int) error {
-	if client, ok := s.mapping[connID]; ok {
-		client.alive = false
-		close(client.closeChan)
-	}
+	client := s.clients[connID]
+	client.alive = false
+	close(client.closeChan)
 	return nil
 }
 
 func (s *server) Close() error {
 	close(s.closeChan)
 	s.alive = false
+	for _, c := range s.clients {
+		c.alive = false
+		close(c.closeChan)
+	}
 	return nil
 }
-
 
 
 func (s *server) handleRead(msg *Message) {
@@ -122,33 +123,33 @@ func (s *server) handleWrite(_client *clientInfo) {
 			if !ok {
 				return
 			}
-			// TODO 注意msg的类型
 			bytes, err := json.Marshal(msg)
 			if err != nil {
 				return
 			}
 
 			mConnID := msg.ConnID
-			if client, ok := s.mapping[mConnID]; ok {
-				if s.alive && client.alive {
-					//真正写消息的地方
-					_, err = _client.udpConn.WriteToUDP(bytes, client.addr)
-					if err != nil{
-						return
-					}
-					println(">>>[INFO] Server send message to client: ", msg.String(), client.addr.String())
-					if msg.Type == MsgData {
-						// 发送完消息，注册计时器到客户端的timer中
-						client.timers[msg.SeqNum] = &timer{
-							timerChan:	make(chan *Message),
-							ackChan:	make(chan bool),
-							epochTimes:	0,
-						}
-						client.timers[msg.SeqNum].timerChan <- msg
-					}
+			client := s.clients[mConnID]
+			if s.alive && client.alive {
+				//真正写消息的地方
+				_, err = _client.udpConn.WriteToUDP(bytes, client.addr)
+				if err != nil{
+					return
 				}
-			} else {
-				return
+				println(">>>[INFO] Server send message to client: ", msg.String(), client.addr.String())
+				if msg.Type == MsgData {
+					// 发送完消息，注册计时器到客户端的timer中
+					timer := &timer{
+						timerChan:	make(chan *Message),
+						ackChan:	make(chan int),
+						epochTimes:	0,
+						//lock:		&sync.Mutex{},
+					}
+					println(">>>[INFO] 服务器端开启计时器:", msg.String())
+					client.timers = append(client.timers, timer)
+					println("服务器端：",len(client.timers), msg.SeqNum)
+					client.timers[msg.SeqNum - 1].timerChan <- msg
+				}
 			}
 
 		case <- s.closeChan:
@@ -175,9 +176,9 @@ func (s *server)handleRequest(conn *lspnet.UDPConn) {
 		}
 		println(">>>[INFO] Server get a connection,", addr.String(), msg.String())
 
-		_, exist := s.mapping[msg.ConnID]
+		//client := s.clients[msg.ConnID]
 
-		if msg.Type == MsgConnect && !exist {
+		if msg.Type == MsgConnect {
 
 			//检查是否已经创建了该连接，若已经创建，discard该消息
 			//timer := &timer{
@@ -192,11 +193,11 @@ func (s *server)handleRequest(conn *lspnet.UDPConn) {
 				writeChan:	 	make(chan *Message, s.params.WindowSize),
 				addr:	     	addr,
 				udpConn:	 	conn,
-				timers:			make(map[int]*timer),
+				timers:			make([]*timer, 0, 0),
 				curSeqNum:		1,
 			}
 			//注册到服务器端的映射关系中
-			s.mapping[_client.connID] = _client
+			s.clients = append(s.clients, _client)
 			//ConnID自增
 			addConnID()
 			//发送ACK给客户端
@@ -204,7 +205,7 @@ func (s *server)handleRequest(conn *lspnet.UDPConn) {
 			go s.handleWrite(_client)
 
 		}else {
-			_client, _ := s.mapping[msg.ConnID]
+			_client := s.clients[msg.ConnID]
 			//该消息已读，跳过
 			//if msg.SeqNum < int(_client.curSeqNum) {
 			//	println(">>>[WARN] Discard message,", msg.String())
@@ -213,16 +214,20 @@ func (s *server)handleRequest(conn *lspnet.UDPConn) {
 
 			if msg.Type == MsgData {
 				//读到dataMsg时更新client的seqNum
-				_client.curSeqNum = int32(msg.SeqNum)
+				//_client.curSeqNum = int32(msg.SeqNum)
 
 				go s.handleRead(msg)
 				//发送ACK给客户端
 				go s.sendAck(_client, msg)
 
 			} else if msg.Type == MsgAck {
-				//接收到ACK，解除超时警报
-				println(">>>[DEBUG] Server handle Read ACK", msg.String())
-				_client.timers[msg.SeqNum].ackChan <- true
+				//if timer, ok := _client.timers[msg.SeqNum-1]; ok {
+				timer := _client.timers[msg.SeqNum - 1]
+					//接收到ACK，解除超时警报
+				println(">>>[DEBUG] Server 接收到 ACK", msg.String())
+				timer.ackChan <- msg.SeqNum
+				//}
+
 			}
 			go s.handleWrite(_client)
 		}
@@ -247,7 +252,8 @@ func (s *server) handleTimer(client *clientInfo, timer *timer)  {
 	for {
 		select {
 		case timerMsg := <- timer.timerChan:
-			timeoutChan := time.After(time.Millisecond * time.Duration(s.params.EpochMillis))
+			for {
+				timeoutChan := time.After(time.Millisecond * time.Duration(s.params.EpochMillis))
 				select {
 				case <-timeoutChan:
 					if timer.epochTimes < s.params.EpochLimit {
@@ -255,16 +261,17 @@ func (s *server) handleTimer(client *clientInfo, timer *timer)  {
 						go client.resend(timerMsg)
 					}else {
 						//达到最大次数，判定连接断开
-						println(">>>[DEBUG] Server message timeout, exiting...")
+						println(">>>[DEBUG] Server message timeout, exiting")
 						client.alive = false
 						close(client.closeChan)
 						return
 					}
-				case <- client.timers[timerMsg.SeqNum].ackChan:
-					println(">>>[DEBUG] 服务器端收到ack，计时器结束")
-					delete(client.timers, timerMsg.SeqNum)
-					return
+				case seq := <- timer.ackChan:
+					println(">>>[DEBUG] 服务器端收到ack，计时器结束, seq:",seq)
+					// TODO: 使用一个doneChan来告诉计时器结束
+					client.timers[seq - 1] = nil
 				}
+			}
 		case <-client.closeChan:
 			println(">>>[INFO]服务器端关闭")
 			return
@@ -277,44 +284,18 @@ func (s *server) handleTimer(client *clientInfo, timer *timer)  {
 处理超时的协程
 */
 func (s *server) handleTimeout() {
+	println(">>>[INFO] 处理超时，", len(s.clients))
+	//time.Sleep(1*time.Second)
 	for {
 		//遍历每个客户端
-		for _, _client := range s.mapping {
+		for _, _client := range s.clients {
 			for _, timer := range _client.timers {
 				if timer != nil {
 					go s.handleTimer(_client, timer)
 				}
 			}
-			/*
-			select {
-			case timerMsg := <- _client.timer.timerChan:
-				timeoutChan := time.After(time.Millisecond * time.Duration(s.params.EpochMillis))
-				select {
-					// 超时重发，最大次数时判定客户端连接挂了
-					case <- timeoutChan:
-						times, ok := _client.timer.epochTimes[timerMsg.SeqNum]
-						//没达到最大epoch次数，触发重发机制
-						if ok && times < s.params.EpochLimit {
-							go _client.resend(timerMsg)
-						}else {
-							//达到最大次数，判定连接断开
-							println(">>>[DEBUG] Message Timeout, ConnID: ", timerMsg.ConnID, ", seqNum: ", timerMsg.SeqNum)
-							_client.alive = false
-							close(_client.closeChan)
-							return
-						}
-					//TODO 未超时情况下，收到客户端的ACK
-					case <- _client.timer.timeoutChanMap[timerMsg.SeqNum]:
-						println(">>>[DEBUG] 服务器端收到ack，",timerMsg.String())
-						continue
-					}
-			case <- _client.closeChan:
-				return
-			}
-			*/
 		}
 	}
-
 }
 /*
 线程安全地自增序列号
@@ -335,8 +316,11 @@ func (c *clientInfo) resend(msg *Message)  {
 	if err != nil {
 		return
 	}
+	timer := c.timers[msg.SeqNum-1]
+	//timer.lock.Lock()
 	//epoch次数加一
-	c.timers[msg.SeqNum].epochTimes = c.timers[msg.SeqNum].epochTimes + 1
+	timer.epochTimes = timer.epochTimes + 1
 	//再次加入计时器
-	c.timers[msg.SeqNum].timerChan <- msg
+	timer.timerChan <- msg
+	//timer.lock.Unlock()
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/lspnet"
 	"strconv"
 	//"time"
+	//"time"
 )
 
 func main()  {
@@ -38,6 +39,8 @@ func main()  {
 	data = []byte("shit")
 	server.Write(cli.ConnID(), data)
 	cli.Read()
+
+	//time.Sleep(2*time.Second)
 
 }
 
