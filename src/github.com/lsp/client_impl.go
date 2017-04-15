@@ -16,9 +16,9 @@ type client struct {
 	readChan 	chan *Message
 	writeChan	chan *Message
 	closeChan	chan byte
-	alive		bool			//服务器是否在线
+	alive		bool			// 服务器是否在线
 	seqNum		int32 			// 消息序列号，只有发送data message时才增长
-	timer 		*timer
+	timers 		map[int]*timer	// 计时器数组
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -81,11 +81,11 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		return nil, errors.New("连接超时")
 	}
 
-	timer := &timer{
-		timerChan:		make(chan *Message),
-		timeoutChanMap: make(map[int] chan *Message),
-		epochTimes:		make(map[int]int),
-	}
+	//timer := &timer{
+	//	timerChan:		make(chan *Message),
+	//	timeoutChanMap: make(chan bool),
+	//	epochTimes:		0,
+	//}
 	client := &client{
 		hostport: 	hostport,
 		params:   	params,
@@ -96,7 +96,7 @@ func NewClient(hostport string, params *Params) (Client, error) {
 		closeChan:	make(chan byte),
 		alive:	  	true,
 		seqNum:		1,
-		timer:		timer,
+		timers:		make(map[int] *timer),
 	}
 
 	go client.handleRead()
@@ -146,7 +146,6 @@ func (c *client) Close() error {
 //用goroutine来不断监听读事件
 func (c *client) handleRead() {
 	for{
-		println("<<<[Client] handle Read...")
 		payload := make([]byte, 1000)
 		n, err := c.udpConn.Read(payload)
 		if err != nil {
@@ -156,6 +155,8 @@ func (c *client) handleRead() {
 		//反序列化消息
 		var message *Message
 		err = json.Unmarshal(payload[:n], &message)
+
+		println("<<<[INFO] 客户端读消息：", message.String())
 
 		switch message.Type {
 		case MsgData:
@@ -169,11 +170,9 @@ func (c *client) handleRead() {
 			}
 			//}
 		case MsgAck:
-			println("<<<[Client] handle Read ACK...", message.String())
+			println("<<<[DEBUG] Client handle Read ACK...", message.String())
 			//接收到ACK，解除超时警报
-			var timeoutChan = make(chan *Message)
-			timeoutChan <- message
-			c.timer.timeoutChanMap[message.SeqNum] = timeoutChan
+			c.timers[message.SeqNum].ackChan <- true
 		}
 
 	}
@@ -198,10 +197,14 @@ func (c *client) handleWrite() {
 				}
 				//写完消息，触发计时器
 				if msg.Type == MsgData {
-					println("<<<[INFO] Client start timer ", msg.String())
-					c.timer.timerChan <- msg
+					println("<<<[INFO] 客户端开启计时器 ", msg.String())
+					c.timers[msg.SeqNum] = &timer{
+						timerChan:	make(chan *Message),
+						ackChan:	make(chan bool),
+						epochTimes:	0,
+					}
+					c.timers[msg.SeqNum].timerChan <- msg
 					//初始化重试次数
-					c.timer.epochTimes[msg.SeqNum] = 0
 				}
 			}
 		case <-c.closeChan:
@@ -221,12 +224,56 @@ func (c *client) sendAck(msg *Message)  {
 }
 
 /*
+处理计时器
+ */
+func (c *client) handleTimer(timer *timer)  {
+	for {
+		select {
+		case timerMsg := <- timer.timerChan:
+			for {
+				timeoutChan := time.After(time.Millisecond * time.Duration(c.params.EpochMillis))
+				select {
+				case <-timeoutChan:
+					if timer.epochTimes < c.params.EpochLimit {
+						println("<<<[DEBUG] Client", timer.epochTimes, "th timeout, resend")
+						go c.resend(timerMsg)
+					}else {
+						//达到最大次数，判定连接断开
+						println("<<<[DEBUG] Message timeout, exiting...")
+						c.alive = false
+						close(c.closeChan)
+						return
+					}
+				case <- c.timers[timerMsg.SeqNum].ackChan:
+					println("<<<[DEBUG] 客户端收到ack，计时器结束")
+					//删除计时器
+					delete(c.timers, timerMsg.SeqNum)
+					return
+				}
+			}
+		case <-c.closeChan:
+			println("<<<[INFO]客户端关闭")
+			return
+		}
+	}
+}
+
+
+/*
 客户端处理超时的协程
  */
 func (c *client) handleTimeout() {
 	for{
+		//对每一个DataMsg创建一个计时器，然后再用一个协程去不断监测是否超时
+		for _, timer := range c.timers {
+			if timer != nil {
+				go c.handleTimer(timer)
+			}
+		}
+		/*
 		select {
 		//开始计时
+		//TODO 这里他妈的也有BUG，timerChan 不应该做成阻塞的，而是对于每个dataMsg都有一个timerChan
 		case timerMsg := <- c.timer.timerChan:
 			println("<<<[DEBUG] Client timer start:", timerMsg.String())
 			timeoutChan := time.After(time.Millisecond * time.Duration(c.params.EpochMillis))
@@ -248,12 +295,13 @@ func (c *client) handleTimeout() {
 				//TODO 这里有bug！！！
 				//收到dataMsg的ack
 				case ack := <- c.timer.timeoutChanMap[timerMsg.SeqNum]:
-					println("<<<[DEBUG] Client get ack ", ack.String())
+					println("<<<[DEBUG] 客户端收到ack ", ack.String(), "，计时器结束")
 					continue
 				}
 		case <- c.closeChan:
 			return
 		}
+		*/
 	}
 }
 
@@ -272,9 +320,9 @@ func (c *client) resend(msg *Message)  {
 		return
 	}
 	//epoch次数加一
-	c.timer.epochTimes[msg.SeqNum] = c.timer.epochTimes[msg.SeqNum] + 1
+	c.timers[msg.SeqNum].epochTimes = c.timers[msg.SeqNum].epochTimes + 1
 	//再次加入计时器
-	c.timer.timerChan <- msg
+	c.timers[msg.SeqNum].timerChan <- msg
 }
 
 func (c *client) atomicAddSeq()  {

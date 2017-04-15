@@ -8,12 +8,13 @@ import (
 	//"time"
 	"github.com/lspnet"
 	"strconv"
+	//"time"
 )
 
 func main()  {
 
 	port := 20001
-	_, err := lsp.NewServer(port, makeParams(1,1000,2))
+	server, err := lsp.NewServer(port, makeParams(1,1000,2))
 	errorHandler(err)
 	println("start server")
 
@@ -27,12 +28,17 @@ func main()  {
 	errorHandler(err)
 	println("start client")
 
-	println(cli.ConnID())
-
-	//server.Read()
-
 	data := []byte("fuck")
 	cli.Write(data)
+	server.Read()
+
+	//time.Sleep(5*time.Second)
+	println("\n=================================================================")
+
+	data = []byte("shit")
+	server.Write(cli.ConnID(), data)
+	cli.Read()
+
 }
 
 func makeParams(epochLimit, epochMillis, windowSize int) *lsp.Params {
